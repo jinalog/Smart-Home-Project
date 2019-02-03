@@ -1,0 +1,494 @@
+#include <Wire.h>
+#include <MagneticSW.h>
+#include <Buzzer.h>
+#include <PIR.h>
+#include <DCMotor.h>
+#include <RgbLcd.h>
+#include <Touch.h>
+#include <FND.h>
+
+//- 센서 및 모듈 핀 & 주소 ----------------------------------------------------
+//- RGBLCD 센서 연결 핀 번호
+#define RS_PIN      62
+#define RW_PIN      63
+#define E_PIN       64
+#define R_PIN       65
+#define G_PIN       66
+#define B_PIN       67
+#define DATA_PIN4   45
+#define DATA_PIN5   44
+#define DATA_PIN6   43
+#define DATA_PIN7   42
+
+//- Touch 센서 I2C 통신 주소 및 인터럽트 번호
+#define TOUCH_ADDR      0x24
+#define TINT_PIN        2
+#define TINT_NUM        0
+
+//- FND 모듈 I2C 통신 주소
+#define FND_1_ADDR      38
+#define FND_2_ADDR      32
+
+#define BUZZER_PIN      11      //- 부저 센서 연결 핀
+#define BUZZER_FRQ      1000    //- 부저 센서 주파수
+
+#define MOTOR_PIN1      7       //- DC 모턴 연결 핀
+#define MOTOR_PIN2      8
+
+#define PIR_PIN        39       //- PIR센서 연결 핀
+#define MAGNETIC_PIN   61       //- 마그네틱 센서 연결 핀
+#define LINE_PIN       60       //라인감지
+#define RAIN_PIN       54       //빗물센서
+#define echo           36       //초음파
+#define trig           37       //초음파
+#define vib            30       //충격감지
+
+//- 동작 모드  ----------------------------------------------------
+#define MODE_REG_C    0        //- 카드 등록 모드
+#define MODE_REG_N    1        //- 비밀번호 등록 모드
+#define MODE_SEC      2        //- 보안 모드
+#define MODE_OFF      3        //- 보안 모드 해제
+#define MODE_ALT      4        //- 경고 모드
+#define MODE_ERR      5        //- 에러 모드
+#define MODE_DOOR     6        //- 개방 모드
+
+//- 센서 및 모듈 객체--------------------------------------------
+RgbLcd                lcd;
+Touch                 touch;
+FND                   fnd;
+MagneticSW            magSW;
+DCMotor               winMotor;
+PIR                   pir;
+Buzzer                buz;
+
+//- 상태 체크 플래그----------------------------------------------
+boolean bRegistCard=false;
+boolean bRegistPw=false;
+boolean bRxCardData=false;
+boolean bErrorCard=false;
+boolean bTouch=false;
+
+//- 데이터 저장 전역 변수 -----------------------------------------
+char rxCardData[16] = {0};
+char registCardData[16] = {0};
+byte errorCnt=0;
+
+byte touchCnt=0;
+byte touchData[4] = {0};
+byte registTouchData[4] = {0};
+
+byte runMode=0;
+byte preMode=0;
+int pirCnt=0;
+
+unsigned long pirTime=0;
+unsigned long alertTime=0;
+unsigned long errorTime=0;
+unsigned long doorTime=0;
+
+//int PIN_Value = analogRead(LINE_PIN);
+
+//------------------------------------------------------------------
+//- Init Function
+//------------------------------------------------------------------
+void setup() {
+  
+  initSensor();             //- 센서 초기화
+  
+  Serial.begin(115200);    //- 디버깅용
+  Serial1.begin(9600);     //- RFID 통신 용
+  
+  setMode(MODE_REG_C);      //- 동작 모드 초기화
+
+  pinMode(trig, OUTPUT);
+  pinMode(echo, INPUT);
+  pinMode(vib, INPUT);
+}
+
+
+//------------------------------------------------------------------
+//- Doing Function
+//------------------------------------------------------------------
+void loop() {
+  switch(runMode) 
+  {
+      case  MODE_REG_C:
+            runRegisterCardMode();  break;
+      case  MODE_REG_N:
+            runRegisterNumberMode();  break;
+      case  MODE_SEC:
+            runSecurityMode();  break;
+      case  MODE_OFF:
+            runOffSecurityMode();  break;
+      case  MODE_ALT:
+            runAlertMode();  break;
+      case  MODE_ERR:
+            runErrorMode();  break;
+      case  MODE_DOOR:
+            runDoorOpenMode();  break;
+  }
+}
+
+//- 센서 및 모듈 초기화 ---------------------------------------------------
+void initSensor() {
+  //- RGBLCD 초기화
+  lcd.begin(RS_PIN, RW_PIN, E_PIN, R_PIN, G_PIN, B_PIN, 
+            DATA_PIN4, DATA_PIN5, DATA_PIN6, DATA_PIN7);
+  lcd.onBacklightGreen();
+  
+  //- DC 모터 초기화
+  winMotor.begin(MOTOR_PIN1, MOTOR_PIN2);
+
+  //- Touch 센서 인터럽트 설정 및 초기화
+  touch.begin(TOUCH_ADDR); 
+  pinMode(TINT_PIN, INPUT); 
+  attachInterrupt(TINT_NUM, touchInterrupt, FALLING);
+  
+  //- FND 초기화 
+  fnd.begin(FND_1_ADDR, FND_2_ADDR);
+  fnd.setAllNum(0);
+  
+  //- 마그네틱 센서 초기화 
+  magSW.begin(MAGNETIC_PIN);
+  
+  //- PIR 초기화 
+  pir.begin(PIR_PIN);
+  
+  //- 부저 초기화 
+  buz.begin(BUZZER_PIN);
+  buz.setFreq(BUZZER_FRQ); 
+}
+
+//- 모드 변경에 따른 LCD , 모드 플래그 설정 ---------------------------------------
+void changeMode(byte r, byte g, byte b, String msg1, String msg2, int newMode)
+{
+      lcdBacklightOn(r, b, b);
+      lcd.clear();     
+      lcd.setCursor(0,0);
+      lcd.print(msg1);
+      
+      lcd.setCursor(0,1);
+      if(!msg2.equals("")) lcd.print(msg2);
+      
+      runMode = newMode;
+}
+
+//- 동작 모드 설정 및 변경 제어 -------------------------------------------------
+void setMode(byte mode) {
+  preMode = runMode; 
+  
+  switch(mode) 
+  {
+    case  MODE_REG_C:        // Register Card Mode
+          changeMode(0, 0, 1, "Please register", "Security card.", MODE_REG_C);
+          break;
+      
+    case MODE_REG_N: 
+         touch.setLed(0x1F);
+         changeMode(0, 0, 1, "Please register", "Security Number.", MODE_REG_N);
+         break;
+      
+    case MODE_SEC:        // Security Mode
+         touch.setLed(0);
+         changeMode(0, 1, 0, "Security Mode", "", MODE_SEC);
+         pirCnt=0;
+         break;
+      
+    case MODE_OFF:        // Security Off Mode
+        touch.setLed(0x1F);
+        changeMode(0, 1, 0, "Off Security Mode", "", MODE_OFF);
+        touchCnt=0;
+        break;
+      
+    case MODE_ALT:        // Alert Mode
+         changeMode(1, 0, 0, "Alert Mode!!", "", MODE_ALT);
+         break;
+      
+    case MODE_ERR:        // Error Mode
+         errorTime = millis();
+         changeMode(1, 0, 0, "Alert Mode!!", "", MODE_ERR);
+         break;
+      
+    case MODE_DOOR:       // Door Open Mode
+         touch.setLed(0);
+         tone(BUZZER_PIN, BUZZER_FRQ, 50);
+         doorTime = millis();
+         changeMode(0, 0, 1, "Open Door", "", MODE_DOOR);
+         break;
+  }
+}
+
+
+//- RFID 리더기에서 받은 데이터 처리 -----------------------------------------
+void serialEvent1() {
+
+  switch(runMode)
+  {
+     case MODE_REG_C: 
+          Serial1.readBytes(registCardData, 16);
+          bRegistCard=true;
+          break;
+         
+     default:
+            Serial1.readBytes(rxCardData, 16);
+            bRxCardData = true;
+            bErrorCard=false;
+            
+            for(int i=0; i<16; i++) 
+            {
+              if(rxCardData[i] != registCardData[i]) {
+                 bErrorCard=true;  
+                 break;
+               }
+            }
+          break; 
+  }
+}
+
+//- 카드 등록 모드 제어 ----------------------------------------------------
+void runRegisterCardMode() {  
+ 
+  if(bRegistCard) {
+    tone(BUZZER_PIN, BUZZER_FRQ, 50);  
+    setMode(MODE_REG_N);
+  }
+}
+
+//- 비밀번호 등록 모드 제어 ----------------------------------------------------
+void runRegisterNumberMode() {
+
+  if(bTouch) 
+  {
+      byte key = touch.getTouchKey(); 
+      if(key > 0 && key != registTouchData[touchCnt-1]) 
+      {
+        registTouchData[touchCnt] = key;  
+        fndSetNum(touchCnt+1, key);      
+        touchCnt++;
+      }
+      bTouch=false;  
+  }
+  
+  //- 비번 등록 후 보안 해제모드 전환
+  if(touchCnt >=4) 
+  {  
+      bRegistPw = true; 
+      fnd.setAllNum(0);  
+      setMode(MODE_OFF);  
+      delay(200);        
+      touchCnt = 0;
+      bTouch=false;
+  }
+}
+
+//- 보안 모드 제어 ---------------------------------------------
+void runSecurityMode() 
+{
+  if(bRxCardData) 
+  {    
+      if(bErrorCard) 
+      {   
+          //- 등록되지 않은 카드의 경우
+          setMode(MODE_ERR);
+          errorCnt++;   
+          bErrorCard=false;  
+          
+          //- 3번 이상 틀린 경우 경고모드 전환
+          if(errorCnt >=3) 
+           { 
+              errorCnt=0;      
+              setMode(MODE_ALT);  
+          }
+      } else {    
+          //- 등록된 카드인 경우 개방 모드 전환
+          errorCnt = 0; 
+          setMode(MODE_OFF); 
+      }
+     bRxCardData = false;  
+  }
+  
+  //- 보안 모드 경우 0.1초 간격으로 침임자 감지 
+  if(millis() - pirTime > 100) 
+  {    
+      pirTime = millis();    
+      if(analogRead(PIR_PIN) == HIGH) 
+      {  
+          pirCnt++;     
+         if(pirCnt > 50) {  //- 50회 이상 물체 감지시 경고모드 전환
+            setMode(MODE_ALT);  
+            pirCnt=0;   
+          }
+      }
+  }
+  //라인감지
+  int QRE_Value = analogRead(LINE_PIN);
+  if (QRE_Value < 660)
+  {
+    //Serial.println("문닫힘");
+  }
+  else
+  {
+    Serial.println("문열림");
+    setMode(MODE_ALT);
+  }
+
+  //빗물센서
+  int readingSensor = analogRead(RAIN_PIN);
+  if(readingSensor < 600)
+  {
+    Serial.println("콘센트 물");
+    setMode(MODE_ALT);
+  }
+  else
+  {
+    //Serial.println("맑음");
+  }
+  delay(10);
+  
+  //- 창문의 마그네틱 센서로 문을 열려고 했는지 체크
+  if(analogRead(MAGNETIC_PIN) < 400) {  
+      Serial.println("창문 열림");
+      setMode(MODE_ALT);   
+  }
+
+  //초음파센서
+  float distance;
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(30);
+  digitalWrite(trig, LOW);
+
+  distance = pulseIn(echo, HIGH) * 17 / 1000;
+  //Serial.print(distance);
+  //Serial.println("cm");
+  if(distance > 25)
+  {
+    setMode(MODE_ALT);  
+    Serial.println("금고 방 문열림");
+  }
+
+  // 충격 감지 
+  if (digitalRead(vib) == LOW) 
+  {
+    Serial.println("금고 충격"); // 시리얼 모니터에 "Vibration Sensing!" 를 출력
+    setMode(MODE_ALT);
+    //delay(1);  // 2초간 대기
+  }
+  else 
+  {  // 그게 아니라면 (a가 LOW가 아니라면)
+    //Serial.println("Nothing"); // 시리얼 모니터에 "Nothing"을 입력
+  }
+  
+}
+
+//- 보안 모드 해제 상태 제어 -----------------------------------------------------------
+void runOffSecurityMode() {
+  //- 보안 해제 상태에서 보안카드 접촉 시 보안모드로 전환
+  if(bRxCardData) {    
+    if(bErrorCard) {
+      bErrorCard = false;
+      return ;
+    }
+    setMode(MODE_SEC); 
+    bRxCardData = false;  
+  }
+  
+  //- 보안 해제 상태에서 비번입력 시 문 개방 모드 전환
+  if(bTouch) 
+  {   
+      byte bErrorPw=false;
+      byte key = touch.getTouchKey();
+      
+      //- 터치된 값 저장
+      if(key > 0 && key != touchData[touchCnt-1]) {
+        touchData[touchCnt++] = key;
+        fndSetNum(touchCnt, key);
+      }
+     
+      if(touchCnt >=4) 
+      {
+          touchCnt = 0;
+          //- 입력 비번과 등록 비번 비교
+          for(int i=0; i<4; i++)
+              if(touchData[i] != registTouchData[i]) bErrorPw=true;
+        
+          if(bErrorPw) 
+          {    
+            if(++errorCnt > 2) 
+            {  
+                tone(BUZZER_PIN, BUZZER_FRQ, 50);  
+                setMode(MODE_SEC);  
+                errorCnt=0;    
+            } else {    
+                tone(BUZZER_PIN, BUZZER_FRQ, 50);  
+                setMode(MODE_ERR);  
+            }
+          } else {   
+              //- 등록된 비번과 맞을 경우 문 개방 모든 전환
+              errorCnt=0;
+              fnd.setAllNum(0);  
+              setMode(MODE_DOOR); 
+          }
+      }
+      bTouch = false;  // Clear Variable
+  }
+}
+
+//- 경고 모드 상태 제어 -----------------------------------------------------------
+void runAlertMode() {
+  
+  //- 등록된 카드 접촉 시 보안해제 모드 전환
+  if(bRxCardData && bErrorCard==false) {  
+       bRxCardData = false;    
+       setMode(MODE_OFF);  
+  }
+  
+  //- 2초 간격으로 경고음 발생
+  if(millis() - alertTime > 2000) {  
+    alertTime = millis();
+    tone(BUZZER_PIN, BUZZER_FRQ, 500); 
+  }
+}
+
+
+//- 에러 모드 상태 제어 -----------------------------------------------------------
+void runErrorMode() {
+  //- 2초 후 이전 모드 상태로 전환
+  if(millis() - errorTime > 2000)  setMode(preMode);
+}
+
+//- 문 개방 모드 상태 제어 --------------------------------------------------------
+void runDoorOpenMode() {
+  winMotor.Start(0);
+  if(millis() - doorTime > 2000) 
+  {  
+      winMotor.Stop();
+      setMode(MODE_OFF); 
+  }
+}
+
+//- RGBLCD 백라이트 설정 --------------------------------------------------------
+void lcdBacklightOn(byte r, byte g, byte b) {
+  lcd.onBacklightRed(r);
+  lcd.onBacklightGreen(g);
+  lcd.onBacklightBlue(b);
+}
+
+//- 터치 인터럽트 처리 핸들러 ---------------------------------------------------
+void touchInterrupt() {
+      bTouch = true;   
+}
+
+//- Touch된 키값 FND 출력 -------------------------------------------------------
+void fndSetNum(byte num, byte key) {
+  byte val=0;
+  
+  switch(key) 
+  {
+    case 1:  val=1;  break;
+    case 2:  val=2;  break;
+    case 4:  val=3;  break;
+    case 8:  val=4;  break;
+    case 16:  val=5;  break;
+  }
+  fnd.setNum(num, val);
+}
