@@ -16,6 +16,6 @@ This sensor is used to generate an warning if water comes into contact with an t
 This sensor is used to check whether the door of a room with a safe is opened.
 4) ***Vibration sensor***: Vibration sensor can detect vibration or impact and detect when there is a direct impact on or around the sensor. This sensor is used to check whether or not physical impact has been applied to a safe through a corresponding sensor.
 
-## [demonstration video(YouTube)](https://www.youtube.com/watch?v=LVDCOZQjSp0)
+## [demo video(YouTube)](https://www.youtube.com/watch?v=LVDCOZQjSp0)
 
 ###### (The source code is attached as a ".txt" file.)
